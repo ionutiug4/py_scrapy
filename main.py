@@ -1,94 +1,53 @@
-from io import BytesIO
-from time import sleep
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from passlib.context import CryptContext
 
-import helium
-from dotenv import load_dotenv
-from PIL import Image
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+from data_management import models, schemas
+from data_management.database import engine, SessionLocal
 
-from smolagents import CodeAgent, tool
-from smolagents.agents import ActionStep
 
-# Load environment variables
-load_dotenv()
+models.Base.metadata.create_all(bind=engine)
 
-@tool
-def search_item_ctrl_f(text: str, nth_result: int = 1) -> str:
-    """
-    Searches for text on the current page via Ctrl + F and jumps to the nth occurrence.
-    Args:
-        text: The text to search for
-        nth_result: Which occurrence to jump to (default: 1)
-    """
-    elements = driver.find_elements(By.XPATH, f"//*[contains(text(), '{text}')]")
-    if nth_result > len(elements):
-        raise Exception(f"Match n°{nth_result} not found (only {len(elements)} matches found)")
-    result = f"Found {len(elements)} matches for '{text}'."
-    elem = elements[nth_result - 1]
-    driver.execute_script("arguments[0].scrollIntoView(true);", elem)
-    result += f"Focused on element {nth_result} of {len(elements)}"
-    return result
 
-@tool
-def go_back() -> None:
-    """Goes back to previous page."""
-    driver.back()
+app = FastAPI()
 
-@tool
-def close_popups() -> str:
-    """
-    Closes any visible modal or pop-up on the page. Use this to dismiss pop-up windows!
-    This does not work on cookie consent banners.
-    """
-    webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-    
-# Configure Chrome options
-chrome_options = webdriver.ChromeOptions()
-chrome_options.add_argument("--force-device-scale-factor=1")
-chrome_options.add_argument("--window-size=1000,1350")
-chrome_options.add_argument("--disable-pdf-viewer")
-chrome_options.add_argument("--window-position=0,0")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Initialize the browser
-driver = helium.start_chrome(headless=False, options=chrome_options)
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# Set up screenshot callback
-def save_screenshot(memory_step: ActionStep, agent: CodeAgent) -> None:
-    sleep(1.0)  # Let JavaScript animations happen before taking the screenshot
-    driver = helium.get_driver()
-    current_step = memory_step.step_number
-    if driver is not None:
-        for previous_memory_step in agent.memory.steps:  # Remove previous screenshots for lean processing
-            if isinstance(previous_memory_step, ActionStep) and previous_memory_step.step_number <= current_step - 2:
-                previous_memory_step.observations_images = None
-        png_bytes = driver.get_screenshot_as_png()
-        image = Image.open(BytesIO(png_bytes))
-        print(f"Captured a browser screenshot: {image.size} pixels")
-        memory_step.observations_images = [image.copy()]  # Create a copy to ensure it persists
+@app.get("/api/hello/")
+def hello_world():
+    return {"message": "Hello World!"}
 
-    # Update observations with current URL
-    url_info = f"Current url: {driver.current_url}"
-    memory_step.observations = (
-        url_info if memory_step.observations is None else memory_step.observations + "\n" + url_info
+@app.post("/users/")
+def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(models.User).filter(
+        or_(models.User.username == user.username, models.User.email == user.email)
+    ).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or email already registered.")
+
+    hashed_password = pwd_context.hash(user.password)
+    db_user = models.User(
+        username=user.username,
+        email=user.email,
+        password_hash=hashed_password
     )
-    
-from smolagents import HfApiModel
 
-# Initialize the model
-model_id = "meta-llama/Llama-3.3-70B-Instruct"  # You can change this to your preferred model
-model = HfApiModel(model_id)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return {"id": db_user.id, "username": db_user.username, "email": db_user.email}
 
-# Create the agent
-agent = CodeAgent(
-    tools=[go_back, close_popups, search_item_ctrl_f],
-    model=model,
-    additional_authorized_imports=["helium"],
-    step_callbacks=[save_screenshot],
-    max_steps=20,
-    verbosity_level=2,
-)
-
-# Import helium for the agent
-agent.python_executor("from helium import *", agent.state)
+@app.get("/users/{user_id}")
+def get_username_by_id(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return{"id": user.id, "username": user.email}
